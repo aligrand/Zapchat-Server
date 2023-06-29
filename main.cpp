@@ -1,31 +1,21 @@
-#include <QGuiApplication>
-#include <QQmlApplicationEngine>
-#include <QQmlContext>
-#include "TcpServer.hpp"
+#include <QCoreApplication>
+
+#include "serverprocess.h"
 
 int main(int argc, char *argv[])
 {
-#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
-    QCoreApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
-#endif
+    QCoreApplication a(argc, argv);
 
-    QGuiApplication app(argc, argv);
+    QSqlDatabase db;
+    db = QSqlDatabase::addDatabase("QSQLITE");
+    db.setDatabaseName("hostDB.sqlite3");
+    db.open();
 
-    QQmlApplicationEngine engine;
-    const QUrl url(QStringLiteral("qrc:/main.qml"));
-    QObject::connect(&engine, &QQmlApplicationEngine::objectCreated,
-                     &app, [url](QObject *obj, const QUrl &objUrl) {
-        if (!obj && url == objUrl)
-            QCoreApplication::exit(-1);
-    }, Qt::QueuedConnection);
+    QSqlQuery sqlQuery;
+    sqlQuery.prepare("PRAGMA foreign_keys = 1;");
+    sqlQuery.exec();
 
-    TcpServer tcpServer;
+    ServerProcess *sp = new ServerProcess;
 
-    engine.rootContext()->setContextProperty("server", &tcpServer);
-
-    engine.load(url);
-
-
-
-    return app.exec();
+    return a.exec();
 }
