@@ -13,9 +13,12 @@ ServerProcess::ServerProcess(QObject *parent) : QObject(parent)
     connect(this, &ServerProcess::sendData, this, &ServerProcess::sendDataProc);
     connect(this, &ServerProcess::messageAsData, this, &ServerProcess::messageAsDataProc);
     connect(this, &ServerProcess::messageAsCommand, this, &ServerProcess::messageAsCommandProc);
-    connect(this, &ServerProcess::dataArrived, this, &ServerProcess::sendRun);
-    connect(this, &ServerProcess::start_sendRun, this, &ServerProcess::sendRun);
     connect(server, &QTcpServer::newConnection, this, &ServerProcess::newConnection);
+    connect(&cmdTimer, &QTimer::timeout, this, &ServerProcess::readCMD);
+    connect(&sendTimer, &QTimer::timeout, this, &ServerProcess::sendRun);
+
+    cmdFile = new QFile("cmd.txt");
+    cmdFile->open(QIODevice::ReadWrite | QIODevice::Text);
 
     QFile _jFile("job-queue.txt");
     _jFile.open(QIODevice::ReadOnly | QIODevice::Text);
@@ -28,53 +31,96 @@ ServerProcess::ServerProcess(QObject *parent) : QObject(parent)
     }
     _jFile.close();
 
-    readyReadTimer.start(10);
+    QFile _fjFile("force-job-queue.txt");
+    _fjFile.open(QIODevice::ReadOnly | QIODevice::Text);
+    while (!_fjFile.atEnd())
+    {
+        QStringList _content;
+        _content[0] = _fjFile.readLine().split(' ').first();
+        _content[1] = _fjFile.readLine().split(' ').last();
+        fJob.push_front(_content);
+    }
+    _fjFile.close();
+
+    QString cmd;
+    for (int i = 0; i < job.size() ; --i)
+    {
+        cmd = job[i][1];
+
+        if (cmd == "UPDATE-DB" || cmd == "SET-PASS" || cmd == "UN-EXIST" ||
+                cmd == "ROOM-EXIST" || cmd == "LOGIN" || cmd == "MESSAGE-INDEX" ||
+                cmd == "REMOVE-USER" || cmd == "REMOVE-ROOM" || cmd == "ARRIVE")
+        {
+            fJob.push_back(job[i]);
+            job.removeAt(i);
+        }
+    }
+
+    sendTimer.start(50);
+    readyReadTimer.start(50);
+    cmdTimer.start(2000);
 }
 
 ServerProcess::~ServerProcess()
 {
+    cmdFile->close();
+    delete cmdFile;
+
     foreach (const QString &socketList_key, socketList.keys())
     {
         socketList[socketList_key]->close();
         socketList[socketList_key]->deleteLater();
 
         socketList.remove(socketList_key);
-        dataSizeList.remove(socketList_key);
     }
 
     QFile _jFile("job-queue.txt");
     _jFile.open(QIODevice::WriteOnly | QIODevice::Text);
     _jFile.resize(0);
-    while (job_delPending.size() > 0)
+    while (j_delPending.size() > 0)
     {
-        _jFile.write((job_delPending.last()[0] + " " + job_delPending.last()[1] + "\n").toStdString().c_str());
-        job_delPending.pop_back();
+        _jFile.write((j_delPending.last()[0] + " " + j_delPending.last()[1] + "\n").toStdString().c_str());
+        j_delPending.pop_back();
     }
     while (job.size() > 0)
     {
         _jFile.write((job.last()[0] + " " + job.last()[1] + "\n").toStdString().c_str());
         job.pop_back();
     }
+    foreach (const QStringList &sList, offlineJob)
+    {
+        _jFile.write((sList[0] + " " + sList[1] + "\n").toStdString().c_str());
+    }
     _jFile.close();
+
+    QFile _fjFile("job-queue.txt");
+    _fjFile.open(QIODevice::WriteOnly | QIODevice::Text);
+    _fjFile.resize(0);
+    while (fJob.size() > 0)
+    {
+        _fjFile.write((fJob.last()[0] + " " + fJob.last()[1] + "\n").toStdString().c_str());
+        fJob.pop_back();
+    }
+    _fjFile.close();
 }
 
-void ServerProcess::sendDataProc(QByteArray sData, QTcpSocket *socket, int &dataSize)
+void ServerProcess::sendDataProc(QByteArray sData, QTcpSocket *socket)
 {
     QDataStream socketStream(socket);
 
     socketStream << sData;
-    dataSize = static_cast<int>(socket->bytesToWrite());
 }
 
 void ServerProcess::commandProc(QString cmd, QString receiverUsername)
 {
+    QString cmdName = cmd.split(" ").first();
     QStringList _content = {receiverUsername, cmd};
 
-    if (job.size() == 0)
+    if (cmdName == "UN-EXIST-RESULT" || cmdName == "ROOM-EXIST-RESULT" ||
+            cmdName == "LOGIN-RESULT" || cmdName == "MESSAGE-INDEX-RESULT" ||
+            cmdName == "REMOVE-USER" || cmdName == "REMOVE-ROOM" || cmdName == "ARRIVE")
     {
-        job.push_front(_content);
-
-        emit start_sendRun();
+        fJob.push_front(_content);
     }
     else
     {
@@ -90,7 +136,7 @@ void ServerProcess::newMessage()
 
         if (socketList[socketList_key]->bytesAvailable() == 0)
         {
-            return;
+            continue;
         }
 
         QDataStream socketStream(socketList[socketList_key]);
@@ -101,7 +147,7 @@ void ServerProcess::newMessage()
 
         if (!socketStream.commitTransaction())
         {
-            return;
+            continue;
         }
 
         if (data.at(0) == 0)
@@ -110,19 +156,19 @@ void ServerProcess::newMessage()
         }
         else
         {
-            emit messageAsData(data);
+            emit messageAsData(data, socketList_key);
         }
     }
 }
 
-void ServerProcess::messageAsDataProc(QByteArray rData)
+void ServerProcess::messageAsDataProc(QByteArray rData, QString senderUsername)
 {
     QString fileName, fileFormat, dir;
 
     fileName = rData.mid(1, 60);
     fileFormat = rData.mid(61, 10);
 
-    qDebug() << fileName << "." << fileFormat;
+    qDebug() << "RECIVE" << fileName << "." << fileFormat;
 
     if (fileName[fileName.size() - 1] == "I")
     {
@@ -145,6 +191,9 @@ void ServerProcess::messageAsDataProc(QByteArray rData)
         dir = "Profiles/";
     }
 
+    emit command("ARRIVE", senderUsername);
+
+    QFile::remove(dir + fileName + "." + fileFormat);
     QFile file(dir + fileName + "." + fileFormat);
     file.open(QIODevice::WriteOnly);
     file.write(rData.mid(71));
@@ -157,7 +206,7 @@ void ServerProcess::messageAsCommandProc(QByteArray rData, QString senderUsernam
     QString cmdName = cmd.split(" ").first();
     QString cmdArgs = QString::fromStdString(cmd.toStdString().substr(static_cast<size_t>(cmd.indexOf(" ")) + 1));
 
-    qDebug() << senderUsername << " -- " << cmd;
+    qDebug() << "RECIVE" << senderUsername << " -- " << cmd;
 
     QRegularExpression dbRegex("(?<=ƒ)[^ƒ]*(?=ƒ)");
     QRegularExpressionMatch dbMatch;
@@ -224,7 +273,7 @@ void ServerProcess::messageAsCommandProc(QByteArray rData, QString senderUsernam
         sqlQuery.addBindValue(dbList[10]);
         sqlQuery.exec();
 
-        sqlQuery.prepare("UPDATE messages SET messageIndex=messageIndex+1 WHERE username=?");
+        sqlQuery.prepare("UPDATE users SET messageIndex=messageIndex+1 WHERE username=?");
         sqlQuery.addBindValue(dbList[2]);
         sqlQuery.exec();
 
@@ -247,7 +296,11 @@ void ServerProcess::messageAsCommandProc(QByteArray rData, QString senderUsernam
         sqlQuery.prepare("SELECT roomID FROM messages WHERE id=?");
         sqlQuery.addBindValue(cmdArgs);
         sqlQuery.exec();
-        sqlQuery.first();
+        if (!sqlQuery.first())
+        {
+            return;
+        }
+
         QString _roomID = sqlQuery.value("roomID").toString();
 
         sqlQuery.prepare("DELETE FROM messages WHERE id=?");
@@ -402,7 +455,10 @@ void ServerProcess::messageAsCommandProc(QByteArray rData, QString senderUsernam
         sqlQuery.addBindValue(cmdArgs);
         sqlQuery.addBindValue(senderUsername);
         sqlQuery.exec();
-        sqlQuery.first();
+        if (!sqlQuery.first())
+        {
+            return;
+        }
 
         do
         {
@@ -478,7 +534,7 @@ void ServerProcess::messageAsCommandProc(QByteArray rData, QString senderUsernam
             sqlQuery.exec();
             if (!sqlQuery.first())
             {
-                return;
+                continue;
             }
 
             do
@@ -537,6 +593,7 @@ void ServerProcess::messageAsCommandProc(QByteArray rData, QString senderUsernam
                << sqlQuery.value("isOnline").toString();
         record.end();
 
+        emit command("_UPLOAD_ Profiles/" + sqlQuery.value("photoADDRESS").toString(), senderUsername);
         emit command("ADD-USER " + QString(record), senderUsername);
 
         record.clean();
@@ -555,6 +612,7 @@ void ServerProcess::messageAsCommandProc(QByteArray rData, QString senderUsernam
                << sqlQuery.value("isOnline").toString();
         record.end();
 
+        emit command("_UPLOAD_ Profiles/" + sqlQuery.value("photoADDRESS").toString(), cmdArgs);
         emit command("ADD-USER " + QString(record), cmdArgs);
 
         record.clean();
@@ -574,9 +632,8 @@ void ServerProcess::messageAsCommandProc(QByteArray rData, QString senderUsernam
             return;
         }
 
-        record << sqlQuery.value("id").toString() << sqlQuery.value("name").toString()
-               << sqlQuery.value("photoADDRESS").toString() << sqlQuery.value("info").toString()
-               << sqlQuery.value("type").toString() << sqlQuery.value("pin").toString();
+        record << sqlQuery.value("id").toString() << "" << "" << ""
+               << sqlQuery.value("type").toString() << "";
         record.end();
 
         emit command("ADD-ROOM " + QString(record), senderUsername);
@@ -600,21 +657,22 @@ void ServerProcess::messageAsCommandProc(QByteArray rData, QString senderUsernam
             return;
         }
 
-        record.clean();
-
         do
         {
+            record.clean();
+
             record << sqlQuery.value("userID").toString() << sqlQuery.value("roomID").toString()
                    << sqlQuery.value("role").toString();
             record.end();
 
-            emit command("ADD-PARTICIPANTS " + QString(record), senderUsername);
-            emit command("ADD-PARTICIPANTS " + QString(record), cmdArgs);
+            emit command("ADD-PARTICIPANT " + QString(record), senderUsername);
+            emit command("ADD-PARTICIPANT " + QString(record), cmdArgs);
         } while (sqlQuery.next());
     }
     else if (cmdName == "ENTER-ROOM")
     {
         SqlRecordQString senderUserRecord;
+
         sqlQuery.prepare("SELECT * FROM users WHERE username=?");
         sqlQuery.addBindValue(senderUsername);
         sqlQuery.exec();
@@ -629,10 +687,9 @@ void ServerProcess::messageAsCommandProc(QByteArray rData, QString senderUsernam
                          << sqlQuery.value("isOnline").toString();
         senderUserRecord.end();
 
-        sqlQuery.prepare("SELECT * FROM ((rooms "
-                         "INNER JOIN participants ON participants.roomID=rooms.id) "
-                         "INNER JOIN users ON users.username=participants.userID)"
-                         "WHERE rooms.id=?");
+        QString photo = sqlQuery.value("photoADDRESS").toString();
+
+        sqlQuery.prepare("SELECT * FROM rooms WHERE id=?");
         sqlQuery.addBindValue(cmdArgs);
         sqlQuery.exec();
         if (!sqlQuery.first())
@@ -645,9 +702,20 @@ void ServerProcess::messageAsCommandProc(QByteArray rData, QString senderUsernam
                << sqlQuery.value("type").toString() << sqlQuery.value("pin").toString();
         record.end();
 
+        emit command("_UPLOAD_ Profiles/" + sqlQuery.value("photoADDRESS").toString(), senderUsername);
         emit command("ADD-ROOM " + QString(record), senderUsername);
 
         record.clean();
+
+        sqlQuery.prepare("SELECT * FROM users INNER JOIN participants "
+                         "ON participants.userID=users.username "
+                         "WHERE participants.roomID=?");
+        sqlQuery.addBindValue(cmdArgs);
+        sqlQuery.exec();
+        if (!sqlQuery.first())
+        {
+            return;
+        }
 
         do
         {
@@ -657,6 +725,7 @@ void ServerProcess::messageAsCommandProc(QByteArray rData, QString senderUsernam
                    << sqlQuery.value("isOnline").toString();
             record.end();
 
+            emit command("_UPLOAD_ Profiles/" + sqlQuery.value("photoADDRESS").toString(), senderUsername);
             emit command("ADD-USER " + QString(record), senderUsername);
 
             record.clean();
@@ -672,8 +741,9 @@ void ServerProcess::messageAsCommandProc(QByteArray rData, QString senderUsernam
             record << senderUsername << cmdArgs << "G";
             record.end();
 
+            emit command("_UPLOAD_ Profiles/" + photo, sqlQuery.value("username").toString());
             emit command("ADD-USER " + QString(senderUserRecord), sqlQuery.value("username").toString());
-            emit command("ADD-PARTICIPANTS " + QString(record), sqlQuery.value("username").toString());
+            emit command("ADD-PARTICIPANT " + QString(record), sqlQuery.value("username").toString());
 
             record.clean();
         } while(sqlQuery.next());
@@ -686,7 +756,7 @@ void ServerProcess::messageAsCommandProc(QByteArray rData, QString senderUsernam
         record << senderUsername << cmdArgs << "G";
         record.end();
 
-        emit command("ADD-PARTICIPANTS " + QString(record), senderUsername);
+        emit command("ADD-PARTICIPANT " + QString(record), senderUsername);
     }
     else if (cmdName == "UN-EXIST")
     {
@@ -696,33 +766,18 @@ void ServerProcess::messageAsCommandProc(QByteArray rData, QString senderUsernam
         sqlQuery.first();
         int sqlsize = sqlQuery.value("COUNT(*)").toInt();
 
-        QByteArray data;
-        QByteArray header;
+        QString data;
 
         if (sqlsize == 0)
         {
-            data = QString("UN-EXIST-RESULT %1 0").arg(cmdArgs).toUtf8();
-
-            header.append(char(0));
-            header.append("");
-            header.resize(61);
-            header.append("");
-            header.resize(71);
-            header.append(data);
+            data = "UN-EXIST-RESULT " + cmdArgs + " 0";
         }
         else // > 0 and -1
         {
-            data = QString("UN-EXIST-RESULT %1 1").arg(cmdArgs).toUtf8();
-
-            header.append(char(0));
-            header.append("");
-            header.resize(61);
-            header.append("");
-            header.resize(71);
-            header.append(data);
+            data = "UN-EXIST-RESULT " + cmdArgs + " 1";
         }
 
-        emit sendData(header, socketList[senderUsername], dataSizeList[senderUsername]);
+        emit command(data, senderUsername);
     }
     else if (cmdName == "ROOM-EXIST")
     {
@@ -732,33 +787,18 @@ void ServerProcess::messageAsCommandProc(QByteArray rData, QString senderUsernam
         sqlQuery.first();
         int sqlsize = sqlQuery.value("COUNT(*)").toInt();
 
-        QByteArray data;
-        QByteArray header;
+        QString data;
 
         if (sqlsize == 0)
         {
-            data = QString("ROOM-EXIST-RESULT %1 0").arg(cmdArgs).toUtf8();
-
-            header.append(char(0));
-            header.append("");
-            header.resize(61);
-            header.append("");
-            header.resize(71);
-            header.append(data);
+            data = "ROOM-EXIST-RESULT " + cmdArgs + " 0";
         }
         else // > 0 and -1
         {
-            data = QString("ROOM-EXIST-RESULT %1 1").arg(cmdArgs).toUtf8();
-
-            header.append(char(0));
-            header.append("");
-            header.resize(61);
-            header.append("");
-            header.resize(71);
-            header.append(data);
+            data = "ROOM-EXIST-RESULT " + cmdArgs + " 1";
         }
 
-        emit sendData(header, socketList[senderUsername], dataSizeList[senderUsername]);
+        emit command(data, senderUsername);
     }
     else if(cmdName == "LOGIN")
     {
@@ -768,8 +808,7 @@ void ServerProcess::messageAsCommandProc(QByteArray rData, QString senderUsernam
         sqlQuery.first();
         int sqlsize = sqlQuery.value("COUNT(*)").toInt();
 
-        QByteArray data;
-        QByteArray header;
+        QString data;
 
         sqlQuery.prepare("SELECT password FROM users WHERE username=?");
         sqlQuery.addBindValue(cmdArgs.split(" ").first());
@@ -778,55 +817,39 @@ void ServerProcess::messageAsCommandProc(QByteArray rData, QString senderUsernam
 
         if (sqlsize == 0)
         {
-            data = QString("LOGIN-RESULT 0").toUtf8();
-
-            header.append(char(0));
-            header.append("");
-            header.resize(61);
-            header.append("");
-            header.resize(71);
-            header.append(data);
+            data = "LOGIN-RESULT 0";
         }
         else if (sqlQuery.value("password").toString() == cmdArgs.split(" ").last())
         {
             QTcpSocket *s = socketList[senderUsername];
-            int ds = dataSizeList[senderUsername];
 
             socketList.remove(senderUsername);
-            dataSizeList.remove(senderUsername);
 
             socketList.insert(cmdArgs.split(" ").first(), s);
-            dataSizeList.insert(cmdArgs.split(" ").first(), ds);
 
             senderUsername = cmdArgs.split(" ").first();
 
-            data = QString("LOGIN-RESULT 1").toUtf8();
+            foreach (const QStringList &sList, offlineJob)
+            {
+                if (sList[0] == senderUsername)
+                {
+                    job.push_front(sList);
+                    offlineJob.removeOne(sList);
+                }
+            }
 
-            header.append(char(0));
-            header.append("");
-            header.resize(61);
-            header.append("");
-            header.resize(71);
-            header.append(data);
+            data = "LOGIN-RESULT 1";
         }
         else
         {
-            data = QString("LOGIN-RESULT 2").toUtf8();
-
-            header.append(char(0));
-            header.append("");
-            header.resize(61);
-            header.append("");
-            header.resize(71);
-            header.append(data);
+            data = "LOGIN-RESULT 2";
         }
 
-        emit sendData(header, socketList[senderUsername], dataSizeList[senderUsername]);
+        emit command(data, senderUsername);
     }
     else if (cmdName == "MESSAGE-INDEX")
     {
-        QByteArray data;
-        QByteArray header;
+        QString data;
 
         sqlQuery.prepare("SELECT messageIndex FROM users WHERE username=?");
         sqlQuery.addBindValue(senderUsername);
@@ -836,16 +859,26 @@ void ServerProcess::messageAsCommandProc(QByteArray rData, QString senderUsernam
             return;
         }
 
-        data = QString("MESSAGE-INDEX-RESULT %1").arg(sqlQuery.value("messageIndex").toString()).toUtf8();
+        data = "MESSAGE-INDEX-RESULT %1"+ sqlQuery.value("messageIndex").toString();
 
-        header.append(char(0));
-        header.append("");
-        header.resize(61);
-        header.append("");
-        header.resize(71);
-        header.append(data);
+        emit command(data, senderUsername);
+    }
+    else if (cmdName == "ARRIVE")
+    {
+        for (int i = j_delPending.size() - 1; i >= 0; --i)
+        {
+            if (j_delPending[i][0] == senderUsername)
+            {
+                j_delPending.removeAt(i);
 
-        emit sendData(header, socketList[senderUsername], dataSizeList[senderUsername]);
+                break;
+            }
+        }
+    }
+
+    if (cmdName != "ARRIVE")
+    {
+        emit command("ARRIVE", senderUsername);
     }
 }
 
@@ -856,30 +889,43 @@ void ServerProcess::sendRun()
     QByteArray header;
     QByteArray data;
 
-    if (job.size() == 0)
+    if (fJob.size() > 0)
+    {
+        final_user = fJob.last()[0];
+        final_cmd = fJob.last()[1];
+
+        fJob.pop_back();
+    }
+    else if (job.size() > 0)
+    {
+        final_user = job.last()[0];
+        final_cmd = job.last()[1];
+
+        job.pop_back();
+    }
+    else
     {
         return;
     }
-
-    final_user = job.last()[0];
-    final_cmd = job.last()[1];
 
     QStringList _content = {final_user, final_cmd};
 
     if (!socketList.contains(final_user))
     {
-        job.pop_back();
-        job.push_front(_content);
+        offlineJob.append(_content);
 
-        emit start_sendRun();
         return;
     }
 
-    job.pop_back();
-    job_delPending.push_front(_content);
+    qDebug() << "SEND" << final_user << " -- " << final_cmd;
 
     if (final_cmd.split(" ").first() == "_UPLOAD_")
     {
+        if (final_cmd.split(" ").last().isEmpty())
+        {
+            return;
+        }
+
         QString filePath = QString::fromStdString(final_cmd.toStdString().substr(static_cast<size_t>(final_cmd.indexOf(" ")) + 1));
         QFile _file(filePath);
         if (!_file.open(QIODevice::ReadOnly))
@@ -888,6 +934,9 @@ void ServerProcess::sendRun()
 
             return;
         }
+
+        j_delPending.push_front(_content);
+
         data = _file.readAll();
         _file.close();
 
@@ -899,6 +948,8 @@ void ServerProcess::sendRun()
     }
     else
     {
+        j_delPending.push_front(_content);
+
         data = final_cmd.toUtf8();
 
         header.append(char(0));
@@ -910,7 +961,7 @@ void ServerProcess::sendRun()
 
     header.append(data);
 
-    emit sendData(header, socketList[final_user], dataSizeList[final_user]);
+    emit sendData(header, socketList[final_user]);
 }
 
 void ServerProcess::disconnectedProc()
@@ -924,34 +975,11 @@ void ServerProcess::disconnectedProc()
             qDebug() << "del connection === " << socketList_key;
 
             socketList.remove(socketList_key);
-            dataSizeList.remove(socketList_key);
             break;
         }
     }
 
     socket->deleteLater();
-}
-
-void ServerProcess::dataArrivedProc(int channel, qint64 bytes)
-{
-    QTcpSocket *socket = reinterpret_cast<QTcpSocket *>(sender());
-
-    dataSizeList[socketList.key(socket)] -= bytes;
-
-    if (dataSizeList[socketList.key(socket)] == 0)
-    {
-        dataSizeList[socketList.key(socket)] = INT_MAX;
-
-        for (int i = 0; i < job_delPending.length(); ++i)
-        {
-            if (job_delPending[i][0] == socketList.key(socket))
-            {
-                job_delPending.remove(i);
-            }
-        }
-
-        emit dataArrived();
-    }
 }
 
 void ServerProcess::newConnection()
@@ -960,12 +988,35 @@ void ServerProcess::newConnection()
         appendToSocketList(server->nextPendingConnection());
 }
 
+void ServerProcess::readCMD()
+{
+    QString cmd = cmdFile->readLine();
+
+    if (cmd.size() == 0)
+    {
+        return;
+    }
+
+    if (cmd.back() == '\n')
+    {
+        cmdFile->resize(0);
+        cmd = cmd.trimmed();
+
+        if (cmd == "exit")
+        {
+            app->exit(0);
+        }
+        else if (cmd == "offjob-size")
+        {
+            qDebug() << "---------------offjob_size---------------" << offlineJob.size();
+        }
+    }
+}
+
 void ServerProcess::appendToSocketList(QTcpSocket* socket)
 {
     socketList.insert(QString::number(socket->socketDescriptor()), socket);
-    dataSizeList.insert(QString::number(socket->socketDescriptor()), INT_MAX);
     connect(socket, &QTcpSocket::disconnected, this, &ServerProcess::disconnectedProc);
-    connect(socket, &QTcpSocket::channelBytesWritten, this, &ServerProcess::dataArrivedProc);
 
     qDebug() << "new connection === " << socket->socketDescriptor();
 }
