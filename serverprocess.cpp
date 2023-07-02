@@ -618,7 +618,7 @@ void ServerProcess::messageAsCommandProc(QByteArray rData, QString senderUsernam
         record.clean();
 
         QDateTime dt = QDateTime::currentDateTimeUtc();
-        QString roomID = dt.toString("dd.MM.yyyy-hh:mm:ss");
+        QString roomID = dt.toString("dd.MM.yyyy-hh.mm.ss");
 
         sqlQuery.prepare("INSERT INTO rooms (id, type) VALUES (?, 0)");
         sqlQuery.addBindValue(roomID);
